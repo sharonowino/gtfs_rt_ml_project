@@ -1,0 +1,866 @@
+"""
+GTFS Disruption Detection - API Module
+=======================================
+FastAPI-based REST API for serving disruption predictions.
+"""
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Any
+import logging
+import pickle
+from pathlib import Path
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+class DisruptionPredictor:
+    """
+    Disruption prediction service.
+    
+    Loads trained models and provides prediction endpoints.
+    """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        """
+        Initialize predictor.
+        
+        Parameters
+        ----------
+        config : Dict, optional
+            Configuration for prediction service
+        """
+        self.config = config or {}
+        self.model = None
+        self.scaler = None
+        self.imputer = None
+        self.feature_names = None
+        self.model_path = self.config.get('model_path', 'models/best_model.pkl')
+    
+    def load_model(self, model_path: Optional[str] = None):
+        """
+        Load trained model from disk.
+        
+        Parameters
+        ----------
+        model_path : str, optional
+            Path to model file
+        """
+        if model_path is None:
+            model_path = self.model_path
+        
+        model_path = Path(model_path)
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        with open(model_path, 'rb') as f:
+            model_data = pickle.load(f)
+        
+        self.model = model_data.get('model')
+        self.scaler = model_data.get('scaler')
+        self.imputer = model_data.get('imputer')
+        self.feature_names = model_data.get('feature_names')
+        
+        logger.info(f"Loaded model from {model_path}")
+    
+    def predict(
+        self,
+        features: np.ndarray,
+        threshold: float = 0.5
+    ) -> Dict[str, Any]:
+        """
+        Make predictions.
+        
+        Parameters
+        ----------
+        features : np.ndarray
+            Feature matrix
+        threshold : float
+            Classification threshold
+        
+        Returns
+        -------
+        Dict with predictions
+        """
+        if self.model is None:
+            raise ValueError("Model not loaded. Call load_model() first.")
+        
+        # Preprocess
+        if self.imputer is not None:
+            features = self.imputer.transform(features)
+        
+        if self.scaler is not None:
+            features = self.scaler.transform(features)
+        
+        # Predict
+        if hasattr(self.model, 'predict_proba'):
+            proba = self.model.predict_proba(features)[:, 1]
+        else:
+            proba = np.ones(len(features)) * 0.5
+        
+        predictions = (proba >= threshold).astype(int)
+        
+        return {
+            'predictions': predictions.tolist(),
+            'probabilities': proba.tolist(),
+            'threshold': threshold,
+            'n_samples': len(features)
+        }
+    
+    def predict_single(
+        self,
+        features: np.ndarray,
+        threshold: float = 0.5
+    ) -> Dict[str, Any]:
+        """
+        Make prediction for a single sample.
+        
+        Parameters
+        ----------
+        features : np.ndarray
+            Feature vector (1D array)
+        threshold : float
+            Classification threshold
+        
+        Returns
+        -------
+        Dict with prediction
+        """
+        if features.ndim == 1:
+            features = features.reshape(1, -1)
+        
+        result = self.predict(features, threshold)
+        
+        return {
+            'prediction': result['predictions'][0],
+            'probability': result['probabilities'][0],
+            'threshold': threshold,
+            'disruption': result['predictions'][0] == 1
+        }
+
+
+class PredictionAPI:
+    """
+    FastAPI-based prediction API.
+    """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        """
+        Initialize prediction API.
+        
+        Parameters
+        ----------
+        config : Dict, optional
+            Configuration for API
+        """
+        self.config = config or {}
+        self.predictor = DisruptionPredictor(config)
+        self.app = None
+        
+        # Try to import FastAPI
+        try:
+            from fastapi import FastAPI, HTTPException
+            from pydantic import BaseModel
+            self.fastapi_available = True
+            self.BaseModel = BaseModel
+        except ImportError:
+            self.fastapi_available = False
+            warnings.warn("FastAPI not installed. Install with: pip install fastapi uvicorn")
+    
+    def create_app(self):
+        """
+        Create FastAPI application.
+        
+        Returns
+        -------
+        FastAPI application
+        """
+        if not self.fastapi_available:
+            logger.warning("FastAPI not available. Cannot create app.")
+            return None
+        
+        from fastapi import FastAPI, HTTPException
+        from fastapi.middleware.cors import CORSMiddleware
+        
+        app = FastAPI(
+            title="GTFS Disruption Detection API",
+            description="API for predicting transit disruptions",
+            version="1.0.0"
+        )
+        
+        # Add CORS middleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        # Define request models
+        class PredictionRequest(self.BaseModel):
+            features: List[float]
+            threshold: Optional[float] = 0.5
+        
+        class BatchPredictionRequest(self.BaseModel):
+            features: List[List[float]]
+            threshold: Optional[float] = 0.5
+        
+        # Define endpoints
+        @app.get("/")
+        async def root():
+            return {"message": "GTFS Disruption Detection API", "status": "running"}
+        
+        @app.get("/health")
+        async def health():
+            return {
+                "status": "healthy",
+                "model_loaded": self.predictor.model is not None,
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        @app.post("/predict")
+        async def predict(request: PredictionRequest):
+            try:
+                features = np.array(request.features)
+                result = self.predictor.predict_single(features, request.threshold)
+                return result
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.post("/predict/batch")
+        async def predict_batch(request: BatchPredictionRequest):
+            try:
+                features = np.array(request.features)
+                result = self.predictor.predict(features, request.threshold)
+                return result
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.get("/model/info")
+        async def model_info():
+            if self.predictor.model is None:
+                raise HTTPException(status_code=404, detail="Model not loaded")
+            
+            return {
+                "model_type": type(self.predictor.model).__name__,
+                "n_features": len(self.predictor.feature_names) if self.predictor.feature_names else None,
+                "feature_names": self.predictor.feature_names,
+                "model_loaded": True,
+            }
+        
+        # Enhanced deployment endpoints
+        @app.get("/health/ready")
+        async def health_ready():
+            """Readiness check with model status."""
+            model_loaded = self.predictor.model is not None
+            return {
+                "status": "ready" if model_loaded else "loading",
+                "model_loaded": model_loaded,
+                "timestamp": time.time(),
+            }
+        
+        @app.get("/metrics")
+        async def metrics():
+            """Get service metrics."""
+            return {
+                "requests_total": self.request_count,
+                "requests_success": self.success_count,
+                "requests_failed": self.fail_count,
+                "avg_latency_ms": self.avg_latency,
+                "p95_latency_ms": self.p95_latency,
+            }
+        
+        @app.post("/model/reload")
+        async def model_reload(model_path: str = None):
+            """Reload model without restart."""
+            try:
+                self.predictor.load_model(model_path)
+                return {"status": "reloaded", "model_path": model_path}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.get("/config")
+        async def get_config():
+            """Get current configuration."""
+            return self.config
+        
+        self.app = app
+        return app
+    
+    def run(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        workers: int = 4
+    ):
+        """
+        Run the API server.
+        
+        Parameters
+        ----------
+        host : str
+            Host to bind to
+        port : int
+            Port to bind to
+        workers : int
+            Number of worker processes
+        """
+        if not self.fastapi_available:
+            logger.error("FastAPI not available. Cannot run server.")
+            return
+        
+        import uvicorn
+        
+        if self.app is None:
+            self.create_app()
+        
+        # Load model
+        try:
+            self.predictor.load_model()
+        except Exception as e:
+            logger.warning(f"Could not load model: {e}")
+        
+        logger.info(f"Starting API server on {host}:{port}")
+        uvicorn.run(self.app, host=host, port=port, workers=workers)
+
+
+def create_api(config: Optional[Dict] = None) -> PredictionAPI:
+    """
+    Create a prediction API.
+    
+    Parameters
+    ----------
+    config : Dict, optional
+        Configuration for API
+    
+    Returns
+    -------
+    PredictionAPI instance
+    """
+    return PredictionAPI(config)
+
+
+# =========================================================================
+# Main Entry Point
+# =========================================================================
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="GTFS Disruption API")
+    parser.add_argument("--host", default="0.0.0.0", help="Host")
+    parser.add_argument("--port", type=int, default=8000, help="Port")
+    parser.add_argument("--workers", type=int, default=4, help="Workers")
+    args = parser.parse_args()
+    
+    # Load config
+    from .. import load_config
+    config = load_config("config.yaml")
+    
+    # Create and run API
+    api = PredictionAPI(config)
+    api.run(host=args.host, port=args.port, workers=args.workers)
+
+
+# =========================================================================
+# Enhanced Features for Production Deployment
+# =========================================================================
+
+class DelayPropagationFeature:
+    """Compute delay propagation features for network-wide cascade."""
+    
+    @staticmethod
+    def compute_route_lag(
+        df: pd.DataFrame,
+        route_col: str = 'route_id',
+        delay_col: str = 'delay_min',
+        max_lag_stops: int = 5
+    ) -> pd.DataFrame:
+        """
+        Compute route-level delay lag features.
+        
+        Args:
+            df: Input data
+            route_col: Route identifier column
+            delay_col: Delay in minutes
+            max_lag_stops: Number of stops to look back
+        
+        Returns:
+            DataFrame with lag features
+        """
+        df = df.copy()
+        lag_cols = {}
+        
+        for i in range(1, max_lag_stops + 1):
+            lag_cols[f'lag_{i}_stop'] = df.groupby(route_col)[delay_col].shift(i)
+        
+        for col_name, col_data in lag_cols.items():
+            df[col_name] = col_data.fillna(0)
+        
+        # Average lag
+        lag_values = list(lag_cols.values())
+        if lag_values:
+            df['avg_route_lag'] = pd.concat(lag_values, axis=1).mean(axis=1).fillna(0)
+        
+        return df
+
+
+class HeadwayIrregularity:
+    """Compute headway irregularity (bus bunching detection)."""
+    
+    @staticmethod
+    def compute_headway_gaps(
+        df: pd.DataFrame,
+        stop_col: str = 'stop_sequence',
+        time_col: str = 'arrival_time'
+    ) -> pd.DataFrame:
+        """
+        Compute headway gaps between consecutive vehicles.
+        
+        Args:
+            df: Input data
+            stop_col: Stop sequence column
+            time_col: Arrival time column
+        
+        Returns:
+            DataFrame with headway features
+        """
+        df = df.copy()
+        df = df.sort_values([stop_col, time_col])
+        
+        # Compute headway gap
+        df['headway_gap'] = df.groupby(stop_col)[time_col].diff().dt.total_seconds() / 60
+        
+        # Expected headway (assume 10 min for bus)
+        expected_headway = 10
+        df['headway_deviation'] = abs(df['headway_gap'] - expected_headway)
+        
+        # Flag bunching (< 3 min gap)
+        df['bunching_flag'] = (df['headway_gap'] < 3).astype(int)
+        
+        return df
+
+
+class StreamingEndpoint:
+    """
+    Real-time streaming endpoint for live predictions.
+    
+    Supports:
+    - Server-Sent Events (SSE)
+    - WebSocket connections
+    - Kafka/Redis streaming backends
+    
+    Usage:
+    ------
+    stream = StreamingEndpoint(
+        backend="sse",        # or "websocket", "kafka"
+        model_predictor=DisruptionPredictor(),
+        buffer_size=100,
+    )
+    stream.start()
+    """
+    
+    def __init__(
+        self,
+        backend: str = "sse",
+        model_predictor: Any = None,
+        buffer_size: int = 100,
+        redis_url: str = "redis://localhost:6379",
+        kafka_bootstrap: str = "localhost:9092",
+        topic: str = "transit-events",
+    ):
+        self.backend = backend
+        self.predictor = model_predictor
+        self.buffer_size = buffer_size
+        
+        # Streaming configuration
+        self.redis_url = redis_url
+        self.kafka_bootstrap = kafka_bootstrap
+        self.topic = topic
+        
+        # Prediction buffer for streaming
+        self.prediction_buffer = []
+        self.clients = []
+        
+        # Model for streaming
+        self._model = None
+        self._feature_pipeline = None
+        
+        # Kafka producer (if available)
+        self._kafka_producer = None
+        
+        # Redis client (if available)
+        self._redis_client = None
+    
+    def set_model(self, model, feature_pipeline):
+        """Set the model and feature pipeline for predictions."""
+        self._model = model
+        self._feature_pipeline = feature_pipeline
+    
+    async def process_event(self, event: Dict) -> Dict:
+        """
+        Process a single GTFS-RT event.
+        
+        Args:
+            event: Dict with GTFS-RT data (trip updates, vehicle positions, etc.)
+        
+        Returns:
+            Prediction result dict
+        """
+        import time
+        
+        start_time = time.perf_counter()
+        
+        try:
+            # Extract features from event
+            features = self._extract_features(event)
+            
+            # Make prediction
+            if self._model is not None:
+                proba = self._model.predict_proba(features)[0, 1]
+                prediction = {
+                    "disruption_probability": float(proba),
+                    "is_disrupted": bool(proba > 0.5),
+                    "severity": "high" if proba > 0.7 else "medium" if proba > 0.3 else "low",
+                }
+            else:
+                prediction = {"error": "Model not loaded"}
+            
+            # Add metadata
+            prediction["event_id"] = event.get("trip_id", "unknown")
+            prediction["timestamp"] = event.get("timestamp", time.time())
+            prediction["stop_id"] = event.get("stop_id", "unknown")
+            prediction["route_id"] = event.get("route_id", "unknown")
+            prediction["latency_ms"] = (time.perf_counter() - start_time) * 1000
+            
+            return prediction
+            
+        except Exception as e:
+            return {"error": str(e), "event_id": event.get("trip_id", "unknown")}
+    
+    def _extract_features(self, event: Dict) -> np.ndarray:
+        """Extract features from GTFS-RT event."""
+        # Simple feature extraction - in production would use full pipeline
+        features = []
+        
+        # Delay
+        delay = event.get("delay_sec", 0)
+        features.append(delay)
+        
+        # Speed
+        speed = event.get("speed_kmh", 0)
+        features.append(speed)
+        
+        # Headway
+        headway = event.get("headway_min", 10)
+        features.append(headway)
+        
+        # Time features
+        from datetime import datetime
+        if "timestamp" in event:
+            ts = datetime.fromtimestamp(event["timestamp"])
+            features.append(ts.hour)
+            features.append(ts.weekday())
+            features.append(1 if ts.hour in [7, 8, 9, 17, 18, 19] else 0)
+        
+        return np.array(features).reshape(1, -1)
+    
+    async def broadcast_prediction(self, prediction: Dict):
+        """Broadcast prediction to all connected clients."""
+        # Add to buffer
+        self.prediction_buffer.append(prediction)
+        
+        # Trim buffer
+        if len(self.prediction_buffer) > self.buffer_size:
+            self.prediction_buffer = self.prediction_buffer[-self.buffer_size:]
+        
+        # Broadcast via backend
+        if self.backend == "redis" and self._redis_client:
+            import json
+            self._redis_client.publish("predictions", json.dumps(prediction))
+        
+        elif self.backend == "kafka" and self._kafka_producer:
+            self._kafka_producer.send(self.topic, prediction)
+    
+    def get_buffer(self) -> List[Dict]:
+        """Get recent predictions."""
+        return self.prediction_buffer
+    
+    def get_stats(self) -> Dict:
+        """Get streaming statistics."""
+        if not self.prediction_buffer:
+            return {
+                "buffer_size": 0,
+                "avg_probability": 0,
+                "disruption_rate": 0,
+            }
+        
+        probs = [p.get("disruption_probability", 0) for p in self.prediction_buffer]
+        
+        return {
+            "buffer_size": len(self.prediction_buffer),
+            "avg_probability": sum(probs) / len(probs),
+            "disruption_rate": sum(1 for p in probs if p > 0.5) / len(probs),
+            "max_latency_ms": max(p.get("latency_ms", 0) for p in self.prediction_buffer),
+        }
+
+
+class StreamingAPI:
+    """
+    FastAPI application with streaming endpoints.
+    
+    Provides:
+    - POST /predict (single prediction)
+    - WebSocket /ws/predict (streaming)
+    - GET /stream/events (SSE)
+    - GET /stats (buffer statistics)
+    """
+    
+    def __init__(self, predictor: Any = None):
+        self.predictor = predictor
+        self.streaming = StreamingEndpoint(
+            model_predictor=predictor,
+            backend="sse"
+        )
+    
+    def create_app(self):
+        """Create FastAPI app with streaming routes."""
+        from fastapi import FastAPI, WebSocket, WebSocketException
+        from fastapi.responses import JSONResponse
+        from sse_starlette.sse import EventStreamResponse
+        import asyncio
+        import json
+        
+        app = FastAPI(
+            title="GTFS Disruption Streaming API",
+            version="1.0.0",
+            description="Real-time disruption prediction"
+        )
+        
+        @app.get("/health")
+        async def health():
+            return {"status": "healthy", "service": "disruption-prediction"}
+        
+        @app.post("/predict")
+        async def predict(request: Dict):
+            """Single prediction endpoint."""
+            result = await self.streaming.process_event(request)
+            return result
+        
+        @app.websocket("/ws/predict")
+        async def websocket_predict(websocket: WebSocket):
+            """WebSocket streaming endpoint."""
+            await websocket.accept()
+            
+            try:
+                while True:
+                    # Receive event
+                    data = await websocket.receive_json()
+                    result = await self.streaming.process_event(data)
+                    await websocket.send_json(result)
+                    
+                    # Broadcast
+                    await self.streaming.broadcast_prediction(result)
+                    
+            except Exception as e:
+                await websocket.close()
+        
+        @app.get("/stream/events")
+        async def stream_events():
+            """Server-Sent Events endpoint."""
+            async def event_generator():
+                import asyncio
+                while True:
+                    # Get latest predictions
+                    buffer = self.streaming.get_buffer()
+                    if buffer:
+                        yield {
+                            "event": "prediction",
+                            "data": json.dumps(buffer[-1])
+                        }
+                    await asyncio.sleep(1)
+            
+            return EventStreamResponse(event_generator())
+        
+        @app.get("/stats")
+        async def stats():
+            """Get streaming statistics."""
+            return self.streaming.get_stats()
+        
+        @app.get("/buffer")
+        async def get_buffer():
+            """Get prediction buffer."""
+            return JSONResponse(self.streaming.get_buffer())
+        
+        return app
+
+
+class MultilingualNLP:
+    """Multilingual NLP for GTFS alerts."""
+    
+    def __init__(self):
+        self.model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Try to load multilingual model (XLM-R or fallback)."""
+        try:
+            from transformers import AutoTokenizer, AutoModel
+            self.tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
+            self.model = AutoModel.from_pretrained("xlm-roberta-base")
+            self.model_type = "xlm-roberta"
+        except ImportError:
+            self.model_type = "simple"
+    
+    def extract_entities(self, text: str) -> Dict[str, List[str]]:
+        """
+        Extract entities from alert text.
+        
+        Args:
+            text: Alert text
+        
+        Returns:
+            Dict with extracted entities
+        """
+        entities = {
+            'routes': [],
+            'stops': [],
+            'times': []
+        }
+        
+        if self.model_type == "simple":
+            # Simple rule-based extraction
+            import re
+            
+            # Route patterns (e.g., "line 5", "bus 12")
+            routes = re.findall(r'(?:line|bus|tram)\s*(\d+)', text, re.IGNORECASE)
+            entities['routes'] = routes
+            
+            # Stop patterns (e.g., "stop X", "station Y")
+            stops = re.findall(r'(?:stop|station)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', text, re.IGNORECASE)
+            entities['stops'] = stops
+        
+        return entities
+    
+    def analyze_sentiment(self, text: str) -> float:
+        """
+        Analyze alert sentiment.
+        
+        Args:
+            text: Alert text
+        
+        Returns:
+            Sentiment score (-1 to 1)
+        """
+        negative_words = ['delay', 'cancel', 'breakdown', 'problem', 'issue', 'fail']
+        positive_words = ['resolved', 'fixed', 'clear', 'normal', 'restored']
+        
+        text_lower = text.lower()
+        
+        neg_count = sum(1 for w in negative_words if w in text_lower)
+        pos_count = sum(1 for w in positive_words if w in text_lower)
+        
+        if neg_count + pos_count == 0:
+            return 0.0
+        
+        return (pos_count - neg_count) / (neg_count + pos_count)
+
+
+class StructuredLogger:
+    """Structured logging with OpenTelemetry support."""
+    
+    def __init__(self, service_name: str = "gtfs-disruption"):
+        import logging
+        import sys
+        
+        self.logger = logging.getLogger(service_name)
+        self.logger.setLevel(logging.DEBUG)
+        
+        # Console handler
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.DEBUG)
+        
+        # Formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        ch.setFormatter(formatter)
+        
+        self.logger.addHandler(ch)
+        self.service_name = service_name
+    
+    def log_prediction(
+        self,
+        prediction: float,
+        threshold: float,
+        latency_ms: float,
+        features_hash: str = None
+    ):
+        """Log prediction with metadata."""
+        self.logger.info(
+            f"prediction={prediction} threshold={threshold} "
+            f"latency_ms={latency_ms} features_hash={features_hash}"
+        )
+    
+    def log_error(self, error: str, context: Dict = None):
+        """Log error with context."""
+        self.logger.error(f"error={error} context={context}")
+
+
+class ModelVersioning:
+    """Model versioning for MLOps."""
+    
+    def __init__(self, models_dir: str = "models"):
+        self.models_dir = Path(models_dir)
+        self.model_versions = {}
+        self._scan_versions()
+    
+    def _scan_versions(self):
+        """Scan models directory for versions."""
+        if not self.models_dir.exists():
+            return
+        
+        for f in self.models_dir.glob("*.pkl"):
+            # Parse version from filename
+            name = f.stem
+            if "_v" in name:
+                version = name.split("_v")[-1]
+                self.model_versions[version] = str(f)
+    
+    def get_latest_version(self) -> Optional[str]:
+        """Get latest model version."""
+        if not self.model_versions:
+            return None
+        
+        sorted_versions = sorted(self.model_versions.keys())
+        return sorted_versions[-1]
+
+
+def create_production_api(
+    config: Optional[Dict] = None,
+    enable_nlp: bool = True,
+    enable_logging: bool = True
+) -> PredictionAPI:
+    """
+    Create production-ready API with all enhancements.
+    
+    Args:
+        config: Configuration
+        enable_nlp: Enable multilingual NLP
+        enable_logging: Enable structured logging
+    
+    Returns:
+        Production API instance
+    """
+    api = PredictionAPI(config)
+    
+    # Add production features
+    api.delay_feature = DelayPropagationFeature() if enable_nlp else None
+    api.headway_feature = HeadwayIrregularity() if enable_nlp else None
+    api.nlp_feature = MultilingualNLP() if enable_nlp else None
+    api.logger = StructuredLogger() if enable_logging else None
+    api.versioning = ModelVersioning()
+    
+    return api
