@@ -1,0 +1,271 @@
+"""
+Test Data Loader for Dashboard and Pipeline Testing
+=================================================
+Loads synthetic GTFS-RT data for testing the pipeline end-to-end.
+
+Usage:
+------
+from gtfs_disruption.utils.test_data import load_test_data, load_sample_for_dashboard
+
+# Load all test data
+df = load_test_data()
+
+# Load sample for dashboard
+df = load_sample_for_dashboard(n_rows=100)
+"""
+import logging
+import os
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def _get_data_path(filename: str) -> str:
+    """Get full path to test data file."""
+    base = os.path.dirname(os.path.dirname(__file__))
+    return os.path.join(base, "syn_feed", filename)
+
+
+def load_vehicle_positions() -> pd.DataFrame:
+    """Load vehicle positions data."""
+    path = _get_data_path("vehiclePositions.parquet")
+    if not os.path.exists(path):
+        logger.warning(f"Vehicle positions not found: {path}")
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    logger.info(f"Loaded {len(df)} vehicle positions")
+    return df
+
+
+def load_alerts() -> pd.DataFrame:
+    """Load alerts data."""
+    path = _get_data_path("alerts.parquet")
+    if not os.path.exists(path):
+        logger.warning(f"Alerts not found: {path}")
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    logger.info(f"Loaded {len(df)} alerts")
+    return df
+
+
+def load_trip_updates() -> pd.DataFrame:
+    """Load trip updates data."""
+    path = _get_data_path("tripUpdates.parquet")
+    if not os.path.exists(path):
+        logger.warning(f"Trip updates not found: {path}")
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    logger.info(f"Loaded {len(df)} trip updates")
+    return df
+
+
+def merge_vehicle_alerts(
+    vehicles: Optional[pd.DataFrame] = None,
+    alerts: Optional[pd.DataFrame] = None
+) -> pd.DataFrame:
+    """
+    Merge vehicle positions with alert data.
+    
+    Creates a unified DataFrame for testing.
+    """
+    if vehicles is None:
+        vehicles = load_vehicle_positions()
+    if alerts is None:
+        alerts = load_alerts()
+    
+    if vehicles.empty or alerts.empty:
+        logger.warning("Empty input data for merge")
+        return pd.DataFrame()
+    
+    merged = vehicles.copy()
+    
+    if 'route_id' in merged.columns and 'route_id' in alerts.columns:
+        if 'entity_id' in alerts.columns:
+            alerts = alerts.rename(columns={'entity_id': 'alert_entity_id'})
+        
+        merged['route_id_short'] = merged['route_id'].str[:4]
+        alerts['route_id_short'] = alerts.apply(
+            lambda r: r.get('header_text', '')[:4] if pd.notna(r.get('header_text')) else 'GEN',
+            axis=1
+        )
+        
+        alert_cause = alerts.groupby('route_id_short').agg({
+            'cause': lambda x: x.mode().iloc[0] if len(x) > 0 else 'UNKNOWN',
+            'effect': lambda x: x.mode().iloc[0] if len(x) > 0 else 'UNKNOWN',
+            'severity_level': 'mean'
+        }).reset_index()
+        
+        merged = merged.merge(alert_cause, on='route_id_short', how='left')
+        merged['cause'] = merged['cause'].fillna('UNKNOWN')
+        merged['effect'] = merged['effect'].fillna('UNKNOWN')
+        merged['severity_level'] = merged['severity_level'].fillna(1)
+    
+    merged['disruption_target'] = np.where(
+        merged['severity_level'] > 3, 1, 0
+    )
+    
+    if 'latitude' in merged.columns and 'longitude' in merged.columns:
+        merged['first_lat'] = merged['latitude']
+        merged['first_lon'] = merged['longitude']
+        merged['first_loc_text'] = merged['route_id'].fillna('Unknown')
+    
+    for col in ['header_text', 'description_text']:
+        if col not in merged.columns and not alerts.empty:
+            if col in alerts.columns:
+                merged[col] = alerts[col].iloc[0] if len(alerts) > 0 else 'Test alert'
+    
+    merged['disruption_class'] = merged['cause'].fillna('unknown')
+    merged['alert_sentiment'] = np.where(
+        merged['severity_level'] > 4, 'negative',
+        np.where(merged['severity_level'] > 2, 'neutral', 'positive')
+    )
+    
+    logger.info(f"Merged data: {len(merged)} rows")
+    return merged
+
+
+def load_test_data() -> pd.DataFrame:
+    """Load all test data merged together."""
+    vehicles = load_vehicle_positions()
+    alerts = load_alerts()
+    return merge_vehicle_alerts(vehicles, alerts)
+
+
+def load_sample_for_dashboard(
+    n_rows: int = 500,
+    seed: int = 42
+) -> pd.DataFrame:
+    """
+    Load sample data for dashboard testing.
+    
+    Parameters
+    ----------
+    n_rows : int
+        Number of rows to sample (default 500)
+    seed : int
+        Random seed for reproducibility
+        
+    Returns
+    -------
+    pd.DataFrame
+        Sample DataFrame with required columns
+    """
+    np.random.seed(seed)
+    
+    df = load_test_data()
+    
+    if df.empty:
+        logger.warning("No test data available - creating synthetic sample")
+        df = _create_synthetic_sample(n_rows)
+    else:
+        if len(df) > n_rows:
+            df = df.sample(n_rows, random_state=seed)
+    
+    required_cols = [
+        'first_lat', 'first_lon', 'risk_level', 'disruption_class',
+        'route_id', 'cause', 'effect', 'disruption_target'
+    ]
+    
+    for col in required_cols:
+        if col not in df.columns:
+            if col == 'first_lat':
+                df['first_lat'] = 52.37 + np.random.normal(0, 0.5, len(df))
+            elif col == 'first_lon':
+                df['first_lon'] = 4.90 + np.random.normal(0, 0.5, len(df))
+            elif col == 'risk_level':
+                df['risk_level'] = np.random.choice(
+                    ['high', 'moderate', 'low'], len(df), p=[0.2, 0.3, 0.5]
+                )
+            elif col == 'disruption_class':
+                df['disruption_class'] = np.random.choice(
+                    ['technical', 'weather', 'construction'], len(df)
+                )
+            elif col == 'route_id':
+                df['route_id'] = [f"ROUTE_{i%100:03d}" for i in range(len(df))]
+            elif col == 'cause':
+                df['cause'] = np.random.choice(
+                    ['TECHNICAL_PROBLEM', 'WEATHER', 'MAINTENANCE'], len(df)
+                )
+            elif col == 'effect':
+                df['effect'] = np.random.choice(
+                    ['REDUCED_SERVICE', 'DELAYS', 'NO_SERVICE'], len(df)
+                )
+            elif col == 'disruption_target':
+                if 'risk_level' in df.columns:
+                    df['disruption_target'] = df['risk_level'].map({
+                        'high': 1, 'moderate': 1, 'low': 0
+                    }).fillna(0)
+                else:
+                    df['disruption_target'] = np.random.choice([0, 1], len(df), p=[0.7, 0.3])
+    
+    logger.info(f"Prepared {len(df)} rows for dashboard")
+    return df
+
+
+def _create_synthetic_sample(n_rows: int = 500) -> pd.DataFrame:
+    """Create synthetic sample data if no real data available."""
+    np.random.seed(42)
+    
+    cities = ['Amsterdam', 'Rotterdam', 'The Hague', 'Utrecht', 'Eindhoven', 
+             'Groningen', 'Tilburg', 'Almere', 'Breda', 'Nijmegen']
+    
+    causes = ['TECHNICAL_PROBLEM', 'WEATHER', 'MAINTENANCE', 'CONSTRUCTION', 
+              'ACCIDENT', 'STRIKE']
+    effects = ['REDUCED_SERVICE', 'SIGNIFICANT_DELAYS', 'NO_SERVICE', 
+               'DETOUR', 'MODIFIED_SERVICE']
+    
+    lat_center, lon_center = 52.37, 4.90
+    
+    df = pd.DataFrame({
+        'route_id': [f"ROUTE_{i%50:03d}" for i in range(n_rows)],
+        'trip_id': [f"TRIP_{i%200:04d}" for i in range(n_rows)],
+        'vehicle_id': [f"VEH_{i%100:03d}" for i in range(n_rows)],
+        'first_lat': lat_center + np.random.normal(0, 0.5, n_rows),
+        'first_lon': lon_center + np.random.normal(0, 0.5, n_rows),
+        'first_loc_text': np.random.choice(cities, n_rows),
+        'cause': np.random.choice(causes, n_rows),
+        'effect': np.random.choice(effects, n_rows),
+        'severity_level': np.random.randint(1, 10, n_rows),
+        'disruption_target': np.random.choice([0, 1], n_rows, p=[0.7, 0.3]),
+        'header_text': [f"Alert for route {i%50}" for i in range(n_rows)],
+        'description_text': [
+            f"Service disruption in {np.random.choice(cities)}"
+            for _ in range(n_rows)
+        ]
+    })
+    
+    df['risk_level'] = df['disruption_target'].map({1: 'high', 0: 'low'})
+    df['disruption_class'] = df['cause'].str.lower()
+    df['alert_sentiment'] = np.where(df['severity_level'] > 5, 'negative', 'neutral')
+    
+    return df
+
+
+def add_test_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add test features needed for the pipeline."""
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    
+    if 'timestamp' not in df.columns:
+        df['timestamp'] = pd.Timestamp.now()
+    
+    if 'delay_sec' not in df.columns:
+        df['delay_sec'] = np.random.normal(60, 180, len(df))
+        df['delay_sec'] = df['delay_sec'].clip(-300, 1800)
+    
+    if 'speed' not in df.columns:
+        df['speed'] = np.random.exponential(30, len(df))
+    
+    if 'current_status' not in df.columns:
+        df['current_status'] = np.random.choice(
+            ['IN_TRANSIT_TO', 'STOPPED', 'MOVING'], len(df)
+        )
+    
+    return df
