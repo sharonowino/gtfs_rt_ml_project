@@ -1,0 +1,743 @@
+"""
+GTFS Disruption Detection - Feature Engineering Module
+"""
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Point
+from typing import Dict, List, Optional, Tuple
+import logging
+
+from .enrichment import GTFSEnricher, enrich_with_static_gtfs
+from .early_warning import EarlyWarningBuilder, add_early_warning_features
+from .alert_nlp import (
+    AlertNLPEnricher,
+    add_alert_nlp_features,
+    AlertDurationAnalyzer,
+    AlertGeocoder,
+    add_geocoding_features
+)
+from .network_graph import (
+    StopSequenceGraph,
+    HeadwayFeatures,
+    DutchCalendarFeatures,
+    NetworkDisruptionLoad,
+    add_network_features,
+    build_stop_graph
+)
+from .comprehensive_features import (
+    FeatureConfig,
+    TemporalFeatureEngineer,
+    GeospatialFeatureEngineer,
+    HeadwayFeatureEngineer,
+    NetworkFeatureEngineer,
+    NLPAlertFeatureEngineer,
+    ComprehensiveFeatureEngineer,
+    add_comprehensive_features,
+)
+
+logger = logging.getLogger(__name__)
+
+class DisruptionFeatureBuilder:
+    """
+    Constructs core analytical DataFrame combining:
+        - Real-time trip updates (delay_sec, actual_time_sec)
+        - Vehicle positions (speed, lat, lon, vehicle_status)
+        - Static GTFS (route info, stop info, trip direction)
+        - Service alerts (alert text, cause, effect)
+    
+    Output: Single wide DataFrame where each row = one stop event,
+    enriched with every signal needed for disruption detection.
+    """
+    
+    DELAY_LATE_SEC = 120
+    DELAY_EARLY_SEC = -60
+    SPEED_STOPPED = 2.0
+    SPEED_SLOW = 10.0
+    
+    def __init__(self, merged_df: pd.DataFrame, gtfs_data: Dict):
+        self.merged_df = merged_df.copy()
+        self.gtfs = gtfs_data
+    
+    def _ensure_str(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        """Ensure specified columns are string type."""
+        for c in cols:
+            if c in df.columns:
+                df[c] = df[c].astype(str)
+        return df
+    
+    def _prep_trip_updates(self) -> pd.DataFrame:
+        """Prepare trip update features."""
+        df = self.merged_df
+        df = self._ensure_str(df, ['trip_id', 'stop_id', 'stop_sequence'])
+        
+        if 'delay_sec' not in df.columns:
+            if {'actual_time_sec', 'scheduled_time_sec'}.issubset(df.columns):
+                df['delay_sec'] = df['actual_time_sec'] - df['scheduled_time_sec']
+            else:
+                df['delay_sec'] = np.nan
+        
+        df['delay_min'] = df['delay_sec'] / 60.0
+        df['missing_schedule'] = df['scheduled_time_sec'].isna() if 'scheduled_time_sec' in df.columns else True
+        df['delay_flag'] = np.select(
+            [df['delay_sec'] > self.DELAY_LATE_SEC, df['delay_sec'] < self.DELAY_EARLY_SEC],
+            ['late', 'early'], default='on_time'
+        )
+        return df
+    
+    def _prep_vehicle(self) -> pd.DataFrame:
+        """Prepare vehicle position features."""
+        df = self.merged_df
+        df = self._ensure_str(df, ['trip_id', 'vehicle_id', 'stop_id'])
+        
+        if 'speed' not in df.columns:
+            df['speed'] = np.nan
+        
+        df['speed_flag'] = np.select(
+            [df['speed'] <= self.SPEED_STOPPED, df['speed'] <= self.SPEED_SLOW],
+            ['stopped', 'slow'], default='normal'
+        )
+        return df
+    
+    def _prep_alerts(self) -> pd.DataFrame:
+        """Prepare service alert features."""
+        df = self.merged_df
+        df = self._ensure_str(df, ['route_id', 'agency_id'])
+        
+        keep = [c for c in ['route_id', 'agency_id', 'alert_cause', 'alert_effect', 'alert_text'] if c in df.columns]
+        return df[keep].drop_duplicates('route_id') if 'route_id' in df.columns else df[keep]
+    
+    def _merge_static_gtfs(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Enrich with static GTFS data."""
+        trips = self._ensure_str(self.gtfs.get('trips', pd.DataFrame()), ['trip_id', 'route_id'])
+        routes = self._ensure_str(self.gtfs.get('routes', pd.DataFrame()), ['route_id', 'agency_id'])
+        stops = self._ensure_str(self.gtfs.get('stops', pd.DataFrame()), ['stop_id'])
+        agency = self._ensure_str(self.gtfs.get('agency', pd.DataFrame()), ['agency_id'])
+        
+        if not trips.empty and 'trip_id' in df.columns:
+            t_cols = [c for c in ['trip_id', 'route_id', 'direction_id', 'trip_headsign', 'shape_id'] if c in trips.columns]
+            # Drop columns that already exist in df to avoid merge collisions
+            t_cols = [c for c in t_cols if c not in df.columns or c == 'trip_id']
+            if len(t_cols) > 1:  # at least trip_id + one other column
+                df = df.merge(trips[t_cols].drop_duplicates('trip_id'), on='trip_id', how='left')
+        
+        if not routes.empty and 'route_id' in df.columns:
+            r_cols = [c for c in ['route_id', 'agency_id', 'route_short_name', 'route_long_name', 'route_type'] if c in routes.columns]
+            r_cols = [c for c in r_cols if c not in df.columns or c == 'route_id']
+            if len(r_cols) > 1:
+                df = df.merge(routes[r_cols].drop_duplicates('route_id'), on='route_id', how='left')
+        
+        if not stops.empty and 'stop_id' in df.columns:
+            s_cols = [c for c in ['stop_id', 'stop_name', 'stop_lat', 'stop_lon'] if c in stops.columns]
+            s_cols = [c for c in s_cols if c not in df.columns or c == 'stop_id']
+            if len(s_cols) > 1:
+                df = df.merge(stops[s_cols].drop_duplicates('stop_id'), on='stop_id', how='left')
+                # Convert lat/lon to float
+                for coord_col in ('stop_lat', 'stop_lon'):
+                    if coord_col in df.columns and df[coord_col].dtype == 'object':
+                        df[coord_col] = pd.to_numeric(df[coord_col], errors='coerce')
+        
+        if not agency.empty and 'agency_id' in df.columns:
+            a_cols = [c for c in ['agency_id', 'agency_name'] if c in agency.columns]
+            a_cols = [c for c in a_cols if c not in df.columns or c == 'agency_id']
+            if len(a_cols) > 1:
+                df = df.merge(agency[a_cols].drop_duplicates('agency_id'), on='agency_id', how='left')
+        
+        return df
+    
+    def _add_delay_propagation_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add delay propagation features.
+        
+        Features:
+        - prev_trip_delay_at_stop: Delay from previous trip at same stop
+        - cumulative_delay_along_route: Cumulative delay along trip
+        - delay_velocity: Rate of delay change per stop
+        - delay_acceleration: Change in delay velocity
+        - delay_cascade_rate: NEW - How fast delay spreads downstream (per stop sequence)
+        """
+        logger.info("  Adding delay propagation features...")
+        
+        if 'delay_sec' not in df.columns or 'trip_id' not in df.columns:
+            logger.warning("    Missing required columns for delay propagation")
+            return df
+        
+        # Ensure delay_sec is numeric (coerce strings/objects to float)
+        df['delay_sec'] = pd.to_numeric(df['delay_sec'], errors='coerce').fillna(0)
+        
+        # Ensure stop_sequence is numeric (used in cascade rate denominator)
+        if 'stop_sequence' in df.columns:
+            df['stop_sequence'] = pd.to_numeric(df['stop_sequence'], errors='coerce').fillna(method='ffill').fillna(1)
+        
+        # Sort by trip and stop sequence
+        if 'stop_sequence' in df.columns:
+            df = df.sort_values(['trip_id', 'stop_sequence'])
+        else:
+            df = df.sort_values(['trip_id', 'feed_timestamp'] if 'feed_timestamp' in df.columns else ['trip_id'])
+        
+        # Previous trip delay at same stop
+        if 'stop_id' in df.columns:
+            df['prev_trip_delay_at_stop'] = df.groupby('stop_id')['delay_sec'].shift(1)
+            df['prev_trip_delay_at_stop'] = df['prev_trip_delay_at_stop'].fillna(0)
+        
+        # Cumulative delay along route
+        df['cumulative_delay_along_route'] = df.groupby('trip_id')['delay_sec'].cumsum()
+        
+        # Delay velocity (change per stop)
+        df['delay_velocity'] = df.groupby('trip_id')['delay_sec'].diff()
+        df['delay_velocity'] = df['delay_velocity'].fillna(0)
+        
+        # Delay acceleration (change in velocity)
+        df['delay_acceleration'] = df.groupby('trip_id')['delay_velocity'].diff()
+        df['delay_acceleration'] = df['delay_acceleration'].fillna(0)
+        
+        # Delay Cascade Rate - NEW: measures how fast delay spreads downstream
+        if 'stop_sequence' in df.columns and 'stop_id' in df.columns:
+            df['delay_cascade_rate'] = df.groupby(['trip_id'])['delay_sec'].diff() / df.groupby(['trip_id'])['stop_sequence'].diff()
+            df['delay_cascade_rate'] = df['delay_cascade_rate'].fillna(0)
+        
+        return df
+    
+    def _add_headway_instability_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add headway instability features.
+        
+        Features:
+        - headway_regularity: Standard deviation of headways
+        - bunching_indicator: Binary flag for headway < 50% of scheduled
+        - service_gap_ratio: Ratio of actual to scheduled headway
+        - headway_cv: NEW - Coefficient of variation of headway (irregularity measure)
+        """
+        logger.info("  Adding headway instability features...")
+        
+        if 'feed_timestamp' not in df.columns or 'route_id' not in df.columns:
+            logger.warning("    Missing required columns for headway features")
+            return df
+        
+        # Sort by route, stop, and time
+        df = df.sort_values(['route_id', 'stop_id', 'feed_timestamp'])
+        
+        # Calculate headway (time between consecutive vehicles at same stop)
+        df['headway_sec'] = df.groupby(['route_id', 'stop_id'])['feed_timestamp'].diff().dt.total_seconds()
+        
+        # Headway regularity (std of headways per route-stop)
+        headway_stats = df.groupby(['route_id', 'stop_id'])['headway_sec'].agg(['mean', 'std']).reset_index()
+        headway_stats.columns = ['route_id', 'stop_id', 'scheduled_headway', 'headway_regularity']
+        df = df.merge(headway_stats, on=['route_id', 'stop_id'], how='left')
+        
+        # Bunching indicator (headway < 50% of scheduled)
+        df['bunching_indicator'] = (df['headway_sec'] < df['scheduled_headway'] * 0.5).astype(int)
+        
+        # Service gap ratio
+        df['service_gap_ratio'] = df['headway_sec'] / df['scheduled_headway'].replace(0, np.nan)
+        df['service_gap_ratio'] = df['service_gap_ratio'].clip(0, 10)
+        
+        # Headway Coefficient of Variation (CV) - NEW
+        if 'headway_sec' in df.columns:
+            headway_cv = df.groupby(['route_id', 'stop_id'])['headway_sec'].agg(
+                lambda x: x.std() / x.mean() if x.mean() > 0 else 0
+            ).reset_index(name='headway_cv')
+            headway_cv.columns = ['route_id', 'stop_id', 'headway_cv']
+            df = df.merge(headway_cv, on=['route_id', 'stop_id'], how='left')
+            df['headway_cv'] = df['headway_cv'].fillna(0)
+        
+        return df
+    
+    def _add_spatial_disruption_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add spatial disruption clustering features.
+        
+        Features:
+        - stop_disruption_count: Number of disruptions at stop
+        - route_disruption_density: Disruption density per route
+        - spatial_lag_delay: Average delay at neighboring stops
+        """
+        logger.info("  Adding spatial disruption features...")
+        
+        if 'stop_id' not in df.columns or 'route_id' not in df.columns:
+            logger.warning("    Missing required columns for spatial features")
+            return df
+        
+        # Stop disruption count
+        if 'disruption_type' in df.columns:
+            stop_disruptions = df[df['disruption_type'] != 'ON_TIME'].groupby('stop_id').size().reset_index(name='stop_disruption_count')
+            df = df.merge(stop_disruptions, on='stop_id', how='left')
+            df['stop_disruption_count'] = df['stop_disruption_count'].fillna(0)
+        
+        # Route disruption density
+        if 'disruption_type' in df.columns:
+            route_disruptions = df[df['disruption_type'] != 'ON_TIME'].groupby('route_id').size().reset_index(name='route_disruption_count')
+            route_total = df.groupby('route_id').size().reset_index(name='route_total_events')
+            route_density = route_disruptions.merge(route_total, on='route_id')
+            route_density['route_disruption_density'] = route_density['route_disruption_count'] / route_density['route_total_events']
+            df = df.merge(route_density[['route_id', 'route_disruption_density']], on='route_id', how='left')
+        
+        # Spatial lag delay (average delay at stops with similar coordinates)
+        if 'stop_lat' in df.columns and 'stop_lon' in df.columns and 'delay_sec' in df.columns:
+            # Simple spatial lag: average delay at stops within 0.01 degrees
+            df['spatial_lag_delay'] = np.nan
+            for idx, row in df.iterrows():
+                if pd.notna(row['stop_lat']) and pd.notna(row['stop_lon']):
+                    nearby = df[
+                        (abs(df['stop_lat'] - row['stop_lat']) < 0.01) &
+                        (abs(df['stop_lon'] - row['stop_lon']) < 0.01) &
+                        (df.index != idx)
+                    ]
+                    if len(nearby) > 0:
+                        df.loc[idx, 'spatial_lag_delay'] = nearby['delay_sec'].mean()
+        
+        return df
+    
+    def _add_alert_persistence_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add alert persistence features.
+        
+        Features:
+        - alert_duration: Duration of alert in minutes
+        - alert_severity_trend: Trend of alert severity over time
+        - alert_count_last_hour: Number of alerts in last hour
+        """
+        logger.info("  Adding alert persistence features...")
+        
+        if 'has_alert' not in df.columns:
+            logger.warning("    Missing required columns for alert features")
+            return df
+        
+        # Alert duration (if alert start/end times available)
+        if 'alert_start' in df.columns and 'alert_end' in df.columns:
+            df['alert_duration_min'] = (
+                pd.to_datetime(df['alert_end']) - pd.to_datetime(df['alert_start'])
+            ).dt.total_seconds() / 60
+        else:
+            df['alert_duration_min'] = 0
+        
+        # Alert count in last hour
+        if 'feed_timestamp' in df.columns:
+            df = df.sort_values('feed_timestamp')
+            df['alert_count_last_hour'] = 0
+            for idx, row in df.iterrows():
+                if row['has_alert']:
+                    cutoff = row['feed_timestamp'] - pd.Timedelta(hours=1)
+                    recent_alerts = df[
+                        (df['feed_timestamp'] >= cutoff) &
+                        (df['feed_timestamp'] < row['feed_timestamp']) &
+                        (df['has_alert'] == True)
+                    ]
+                    df.loc[idx, 'alert_count_last_hour'] = len(recent_alerts)
+        
+        return df
+    
+    def _add_congestion_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add congestion buildup features.
+        
+        Features:
+        - dwell_time_anomaly: Deviation from average dwell time
+        - stop_congestion_index: Passenger load proxy
+        - vehicle_density: Vehicles per route per hour
+        """
+        logger.info("  Adding congestion features...")
+        
+        # Dwell time anomaly
+        if 'dwell_time_sec' in df.columns:
+            avg_dwell = df.groupby('stop_id')['dwell_time_sec'].transform('mean')
+            df['dwell_time_anomaly'] = df['dwell_time_sec'] - avg_dwell
+        else:
+            df['dwell_time_anomaly'] = 0
+        
+        # Stop congestion index (trip count per stop per hour)
+        if 'feed_timestamp' in df.columns and 'stop_id' in df.columns:
+            df['hour'] = pd.to_datetime(df['feed_timestamp']).dt.hour
+            stop_hour_counts = df.groupby(['stop_id', 'hour']).size().reset_index(name='stop_congestion_index')
+            df = df.merge(stop_hour_counts, on=['stop_id', 'hour'], how='left')
+        
+        # Vehicle density (vehicles per route per hour)
+        if 'feed_timestamp' in df.columns and 'route_id' in df.columns and 'vehicle_id' in df.columns:
+            df['hour'] = pd.to_datetime(df['feed_timestamp']).dt.hour
+            vehicle_counts = df.groupby(['route_id', 'hour'])['vehicle_id'].nunique().reset_index(name='vehicle_density')
+            df = df.merge(vehicle_counts, on=['route_id', 'hour'], how='left')
+        
+        return df
+    
+    def _add_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add temporal and cyclical features.
+        
+        Features:
+        - hour_sin, hour_cos: Cyclical encoding of hour
+        - day_of_week_sin, day_of_week_cos: Cyclical encoding of day
+        - is_peak_hour: Binary flag for peak hours
+        - is_weekend: Binary flag for weekends
+        - rolling_mean_delay_5min: Rolling average delay
+        - delay_trend: Linear trend of delay over time
+        """
+        logger.info("  Adding temporal features...")
+        
+        if 'feed_timestamp' not in df.columns:
+            logger.warning("    Missing timestamp column for temporal features")
+            return df
+        
+        ts = pd.to_datetime(df['feed_timestamp'])
+        
+        # Cyclical encoding for hour
+        df['hour'] = ts.dt.hour
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+        
+        # Cyclical encoding for day of week
+        df['day_of_week'] = ts.dt.dayofweek
+        df['day_of_week_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+        df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+        
+        # Peak hour indicator
+        df['is_peak_hour'] = ((df['hour'] >= 7) & (df['hour'] <= 9) | 
+                              (df['hour'] >= 16) & (df['hour'] <= 19)).astype(int)
+        
+        # Weekend indicator
+        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+        
+        # Rolling mean delay (5-minute window)
+        if 'delay_sec' in df.columns:
+            df = df.sort_values('feed_timestamp')
+            df['rolling_mean_delay_5min'] = df.groupby('route_id')['delay_sec'].transform(
+                lambda x: x.rolling(window=5, min_periods=1).mean()
+            )
+        
+        # Delay trend (linear slope over last 10 observations)
+        if 'delay_sec' in df.columns:
+            df['delay_trend'] = df.groupby('route_id')['delay_sec'].transform(
+                lambda x: x.rolling(window=10, min_periods=2).apply(
+                    lambda y: np.polyfit(range(len(y)), y, 1)[0] if len(y) >= 2 else 0
+                )
+            )
+        
+        return df
+    
+    def _add_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add interaction features between delay and speed.
+        
+        Features:
+        - delay_speed_ratio: Ratio of delay to speed
+        - delay_speed_product: Product of delay and speed
+        - speed_delay_correlation: Correlation between speed and delay
+        """
+        logger.info("  Adding interaction features...")
+        
+        if 'delay_sec' in df.columns and 'speed' in df.columns:
+            # Delay-speed ratio
+            df['delay_speed_ratio'] = df['delay_sec'] / df['speed'].replace(0, np.nan)
+            df['delay_speed_ratio'] = df['delay_speed_ratio'].clip(-100, 100)
+            
+            # Delay-speed product
+            df['delay_speed_product'] = df['delay_sec'] * df['speed']
+            
+            # Speed-delay correlation per route
+            if 'route_id' in df.columns:
+                corr_by_route = df.groupby('route_id').apply(
+                    lambda x: x['speed'].corr(x['delay_sec']) if len(x) > 1 else 0
+                ).reset_index(name='speed_delay_correlation')
+                df = df.merge(corr_by_route, on='route_id', how='left')
+        
+        return df
+    
+    def _add_alert_nlp_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add multilingual NLP features for service alerts.
+        
+        Features:
+        - alert_language: Detected language
+        - alert_language_confidence: Language detection confidence
+        - alert_sentiment: Sentiment (positive/negative/neutral)
+        - alert_sentiment_confidence: Sentiment confidence
+        - alert_entity_count: Count of named entities
+        - alert_entities: JSON string of entities
+        - alert_text_length: Length of alert text
+        - alert_word_count: Word count
+        - alert_duration_hours: Duration of alert
+        - alert_remaining_hours: Remaining active time
+        - alert_age_hours: How long alert has been active
+        - alert_urgency_score: Composite urgency score
+        
+        Requires transformers library.
+        """
+        from .alert_nlp import AlertNLPEnricher
+        
+        logger.info("  Adding alert NLP features...")
+        
+        has_alert_text = any(
+            c in df.columns for c in ['description_text', 'alert_text', 'header_text', 'text']
+        )
+        
+        if not has_alert_text:
+            logger.warning("    No alert text column found - skipping NLP features")
+            return df
+        
+        try:
+            nlp_enricher = AlertNLPEnricher(
+                enable_language_detection=True,
+                enable_ner=True,
+                enable_sentiment=True,
+                enable_topic=False,
+            )
+            df = nlp_enricher.enrich(df)
+        except Exception as e:
+            logger.warning(f"    NLP enrichment failed: {e}")
+        
+        return df
+    
+    def _add_alert_duration_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add duration-aware features for service alerts.
+        
+        Features:
+        - alert_duration_seconds: Total planned duration
+        - alert_duration_minutes: Duration in minutes
+        - alert_duration_hours: Duration in hours
+        - alert_remaining_seconds: Remaining active time
+        - alert_remaining_hours: Remaining hours
+        - alert_is_expired: Has alert expired
+        - alert_is_imminent: Alert starts within 1 hour
+        - alert_age_seconds: How long alert has been active
+        - alert_age_minutes: Age in minutes
+        - alert_is_new: Alert is less than 15 minutes old
+        - alert_cause_id: Numeric cause code
+        - alert_effect_id: Numeric effect code
+        - alert_severity_composite: Combined severity score
+        """
+        logger.info("  Adding alert duration features...")
+        
+        start_col = None
+        end_col = None
+        for sc in ['active_period_start', 'alert_start', 'start_time']:
+            if sc in df.columns:
+                start_col = sc
+                break
+        for ec in ['active_period_end', 'alert_end', 'end_time']:
+            if ec in df.columns:
+                end_col = ec
+                break
+        
+        ts_col = None
+        for tc in ['timestamp', 'feed_timestamp', 'event_time']:
+            if tc in df.columns:
+                ts_col = tc
+                break
+        
+        CAUSE_MAP_NLP = {
+            'UNKNOWN_CAUSE': 0, 'OTHER_CAUSE': 1, 'TECHNICAL_PROBLEM': 2,
+            'STRIKE': 3, 'DEMONSTRATION': 4, 'ACCIDENT': 5,
+            'HOLIDAY': 6, 'WEATHER': 7, 'MAINTENANCE': 8,
+            'CONSTRUCTION': 9, 'POLICE_ACTIVITY': 10, 'MEDICAL_EMERGENCY': 11
+        }
+        EFFECT_MAP_NLP = {
+            'NO_SERVICE': 0, 'REDUCED_SERVICE': 1, 'SIGNIFICANT_DELAYS': 2,
+            'DETOUR': 3, 'ADDITIONAL_SERVICE': 4, 'MODIFIED_SERVICE': 5,
+            'OTHER_EFFECT': 6, 'UNKNOWN_EFFECT': 7, 'STOP_MOVED': 8
+        }
+        
+        if start_col and end_col:
+            start = pd.to_datetime(df[start_col], errors='coerce')
+            end = pd.to_datetime(df[end_col], errors='coerce')
+            df['alert_duration_seconds'] = (end - start).dt.total_seconds()
+            df['alert_duration_minutes'] = df['alert_duration_seconds'] / 60
+            df['alert_duration_hours'] = df['alert_duration_seconds'] / 3600
+            df['alert_duration_days'] = df['alert_duration_seconds'] / 86400
+        
+        if ts_col and end_col:
+            current = pd.to_datetime(df[ts_col], errors='coerce')
+            end = pd.to_datetime(df[end_col], errors='coerce')
+            df['alert_remaining_seconds'] = (end - current).dt.total_seconds()
+            df['alert_remaining_hours'] = df['alert_remaining_seconds'] / 3600
+            df['alert_is_expired'] = (df['alert_remaining_seconds'] <= 0).astype(int)
+            df['alert_is_imminent'] = (
+                (df['alert_remaining_seconds'] > 0) & 
+                (df['alert_remaining_seconds'] <= 3600)
+            ).astype(int)
+        
+        if start_col and ts_col:
+            start = pd.to_datetime(df[start_col], errors='coerce')
+            current = pd.to_datetime(df[ts_col], errors='coerce')
+            df['alert_age_seconds'] = (current - start).dt.total_seconds()
+            df['alert_age_minutes'] = df['alert_age_seconds'] / 60
+            df['alert_age_hours'] = df['alert_age_seconds'] / 3600
+            df['alert_is_new'] = (df['alert_age_minutes'] <= 15).astype(int)
+        
+        if 'cause' in df.columns:
+            df['alert_cause_id'] = df['cause'].map(CAUSE_MAP_NLP).fillna(-1).astype(int)
+        
+        if 'effect' in df.columns:
+            df['alert_effect_id'] = df['effect'].map(EFFECT_MAP_NLP).fillna(-1).astype(int)
+        
+        if 'cause' in df.columns and 'effect' in df.columns:
+            if 'alert_cause_id' in df.columns and 'alert_effect_id' in df.columns:
+                df['alert_severity_composite'] = (
+                    df['alert_cause_id'].abs() + df['alert_effect_id'].abs()
+                )
+        
+        return df
+    
+    def _add_dutch_calendar_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add Dutch temporal calendar features.
+        
+        Features:
+        - is_weekend: Weekend indicator
+        - is_morning_peak: 7-9 AM indicator
+        - is_evening_peak: 4-7 PM indicator
+        - is_peak_hour: Combined peak indicator
+        - is_night: Night hours (10PM-5AM)
+        - is_dutch_holiday: Dutch public holidays
+        - is_school_holiday: School holiday periods
+        - is_school_day: Regular school day
+        - dow_sin, dow_cos: Day of week cyclic encoding
+        - hour_sin, hour_cos: Hour cyclic encoding
+        """
+        logger.info("  Adding Dutch calendar features...")
+        
+        ts_col = None
+        for tc in ['timestamp', 'feed_timestamp', 'event_time']:
+            if tc in df.columns:
+                ts_col = tc
+                break
+        
+        if ts_col is None:
+            logger.warning("    No timestamp column found")
+            return df
+        
+        if not pd.api.types.is_datetime64_any_dtype(df[ts_col]):
+            df[ts_col] = pd.to_datetime(df[ts_col], errors='coerce')
+        
+        dt = df[ts_col]
+        
+        df['hour'] = dt.dt.hour
+        df['day_of_week'] = dt.dt.dayofweek
+        df['month'] = dt.dt.month
+        df['week_of_year'] = dt.dt.isocalendar().week
+        
+        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+        
+        df['is_morning_peak'] = ((df['hour'] >= 7) & (df['hour'] <= 9)).astype(int)
+        df['is_evening_peak'] = ((df['hour'] >= 16) & (df['hour'] <= 19)).astype(int)
+        df['is_peak_hour'] = (df['is_morning_peak'] | df['is_evening_peak']).astype(int)
+        
+        df['is_night'] = ((df['hour'] >= 22) | (df['hour'] <= 5)).astype(int)
+        
+        dutch_holidays = [
+            '2025-01-01', '2025-04-18', '2025-04-20', '2025-04-21',
+            '2025-04-27', '2025-05-01', '2025-05-29', '2025-06-08',
+            '2025-06-09', '2025-12-25', '2025-12-26',
+            '2026-01-01', '2026-04-03', '2026-04-05', '2026-04-06',
+            '2026-04-26', '2026-05-01', '2026-05-14', '2026-05-24',
+            '2026-05-25', '2026-12-25', '2026-12-26',
+        ]
+        df['is_dutch_holiday'] = dt.dt.date.apply(
+            lambda x: x.strftime('%Y-%m-%d') in dutch_holidays
+        ).astype(int)
+        
+        df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+        df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+        
+        return df
+    
+    def _add_network_graph_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add network graph features from stop sequence.
+        
+        Features:
+        - betweenness_centrality: Network importance metric
+        - betweenness_centrality_log: Log-transformed BC
+        - pagerank: PageRank scores
+        - network_disruption_load: 2-hop neighborhood disruption
+        
+        Requires graph to be built externally or pass stop_times_df.
+        """
+        logger.info("  Adding network graph features...")
+        
+        if 'stop_id' not in df.columns:
+            logger.warning("    No stop_id column - skipping network features")
+            return df
+        
+        stop_col = 'stop_id'
+        
+        if 'betweenness_centrality' not in df.columns:
+            bc_col = 'betweenness_centrality'
+        else:
+            bc_col = None
+        
+        if bc_col is None or bc_col not in df.columns:
+            df['betweenness_centrality_derived'] = 0.0
+            df['betweenness_centrality_log_derived'] = 0.0
+            logger.info("    Setting betweenness_centrality to 0 (not computed)")
+        
+        if 'pagerank' not in df.columns:
+            df['pagerank'] = 0.0
+        
+        if 'network_disruption_load' not in df.columns and 'delay_sec' in df.columns:
+            df['network_disruption_load'] = 0.0
+            df['network_load_normalized'] = 0.0
+            logger.info("    Setting network_disruption_load to 0 (graph not available)")
+        
+        return df
+    
+    def build(self) -> pd.DataFrame:
+        """Build feature DataFrame with all enhancements."""
+        logger.info("="*60)
+        logger.info("DisruptionFeatureBuilder.build()")
+        logger.info("="*60)
+        
+        logger.info("[1/8] Preparing features from merged_df...")
+        tu = self._prep_trip_updates()
+        veh = self._prep_vehicle()
+        alr = self._prep_alerts()
+        
+        logger.info("[2/8] Assembling base dataframe...")
+        df = tu.copy()
+        for col in ['speed', 'speed_flag', 'vehicle_id', 'lat', 'lon', 'vehicle_status', 'timestamp']:
+            if col not in df.columns and col in veh.columns:
+                df[col] = veh[col]
+        
+        logger.info("[3/8] Enriching with static GTFS...")
+        df = self._merge_static_gtfs(df)
+        
+        logger.info("[4/8] Attaching alert context...")
+        if 'route_id' in df.columns and 'route_id' in alr.columns:
+            alert_new_cols = [c for c in alr.columns if c not in df.columns or c == 'route_id']
+            df = df.merge(alr[alert_new_cols], on='route_id', how='left')
+        
+        df['has_alert'] = (
+            df['alert_text'].notna() if 'alert_text' in df.columns
+            else df.get('has_overlapping_alert', pd.Series(False, index=df.index))
+        )
+        
+        logger.info("[5/8] Adding delay propagation features...")
+        df = self._add_delay_propagation_features(df)
+        
+        logger.info("[6/8] Adding headway instability features...")
+        df = self._add_headway_instability_features(df)
+        
+        logger.info("[7/8] Adding spatial disruption features...")
+        df = self._add_spatial_disruption_features(df)
+        
+        logger.info("[8/8] Adding alert persistence, congestion, temporal, and interaction features...")
+        df = self._add_alert_persistence_features(df)
+        df = self._add_congestion_features(df)
+        df = self._add_temporal_features(df)
+        df = self._add_interaction_features(df)
+        
+        logger.info("[9/10] Adding alert duration-aware features...")
+        df = self._add_alert_duration_features(df)
+        
+        logger.info("[10/10] Adding multilingual NLP features for alerts...")
+        df = self._add_alert_nlp_features(df)
+        
+        logger.info("[11/11] Adding Dutch calendar features...")
+        df = self._add_dutch_calendar_features(df)
+        
+        logger.info("[12/12] Adding network graph features...")
+        df = self._add_network_graph_features(df)
+        
+        logger.info(f"\nFeature DataFrame built: {df.shape[0]:,} rows x {df.shape[1]} cols")
+        return df
