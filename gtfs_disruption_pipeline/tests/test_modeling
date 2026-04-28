@@ -1,0 +1,149 @@
+"""
+Unit tests for modeling module.
+"""
+import pytest
+import pandas as pd
+import numpy as np
+from gtfs_disruption.modeling import chronological_split, TemporalAwareBalancer, WalkForwardCV
+from gtfs_disruption.modeling.leakage import detect_potential_leakage, verify_temporal_split
+
+class TestChronologicalSplit:
+    """Test chronological_split function."""
+    
+    def test_basic_split(self):
+        """Test basic temporal split."""
+        df = pd.DataFrame({
+            'timestamp': pd.date_range('2024-01-01', periods=100, freq='h'),
+            'value': range(100)
+        })
+        
+        train, val, test = chronological_split(df, 'timestamp', 0.70, 0.15, 0.15)
+        
+        assert len(train) == 70
+        assert len(val) == 15
+        assert len(test) == 15
+        
+        # Verify temporal ordering
+        assert train['timestamp'].max() < val['timestamp'].min()
+        assert val['timestamp'].max() < test['timestamp'].min()
+    
+    def test_invalid_ratios(self):
+        """Test that invalid ratios raise error."""
+        df = pd.DataFrame({
+            'timestamp': pd.date_range('2024-01-01', periods=100, freq='h'),
+            'value': range(100)
+        })
+        
+        with pytest.raises(ValueError):
+            chronological_split(df, 'timestamp', 0.80, 0.15, 0.15)
+
+class TestTemporalAwareBalancer:
+    """Test TemporalAwareBalancer class."""
+    
+    def test_init(self):
+        """Test initialization."""
+        balancer = TemporalAwareBalancer(strategy="class_weight")
+        assert balancer.strategy == "class_weight"
+        assert balancer.class_weights_ is None
+    
+    def test_compute_class_weights(self):
+        """Test class weight computation."""
+        balancer = TemporalAwareBalancer(strategy="class_weight")
+        y = np.array([0, 0, 0, 1, 1])  # 3 negatives, 2 positives
+        
+        weights = balancer.compute_class_weights(y)
+        
+        assert 0 in weights
+        assert 1 in weights
+        assert weights[0] == pytest.approx(5 / (2 * 3))  # n_samples / (n_classes * count)
+        assert weights[1] == pytest.approx(5 / (2 * 2))
+    
+    def test_get_estimator_params_rf(self):
+        """Test parameter generation for Random Forest."""
+        balancer = TemporalAwareBalancer(strategy="class_weight")
+        y = np.array([0, 0, 0, 1, 1])
+        balancer.fit(y)
+        
+        params = balancer.get_estimator_params("random_forest")
+        assert params == {"class_weight": "balanced"}
+    
+    def test_get_estimator_params_xgb(self):
+        """Test parameter generation for XGBoost."""
+        balancer = TemporalAwareBalancer(strategy="class_weight")
+        y = np.array([0, 0, 0, 1, 1])
+        balancer.fit(y)
+        
+        params = balancer.get_estimator_params("xgboost")
+        assert "scale_pos_weight" in params
+        assert params["scale_pos_weight"] == pytest.approx(3 / 2)  # neg / pos
+
+class TestWalkForwardCV:
+    """Test WalkForwardCV class."""
+    
+    def test_init(self):
+        """Test initialization."""
+        cv = WalkForwardCV(n_splits=5, gap=10)
+        assert cv.n_splits == 5
+        assert cv.gap == 10
+    
+    def test_split(self):
+        """Test walk-forward split."""
+        X = np.arange(100)
+        cv = WalkForwardCV(n_splits=3, test_size=20)
+        
+        splits = list(cv.split(X))
+        
+        assert len(splits) == 3
+        
+        # Check first split
+        train_idx, test_idx = splits[0]
+        assert len(train_idx) == 20  # test_size
+        assert len(test_idx) == 20
+        assert train_idx[-1] < test_idx[0]  # temporal ordering
+
+class TestLeakageDetection:
+    """Test leakage detection functions."""
+    
+    def test_detect_potential_leakage(self):
+        """Test leakage detection."""
+        # Create data with suspicious correlation difference
+        X_train = pd.DataFrame({
+            'feature1': [1, 2, 3, 4, 5],
+            'feature2': [5, 4, 3, 2, 1]
+        })
+        y_train = pd.Series([0, 0, 1, 1, 1])
+        
+        X_val = pd.DataFrame({
+            'feature1': [1, 2, 3, 4, 5],
+            'feature2': [1, 2, 3, 4, 5]  # Different correlation pattern
+        })
+        y_val = pd.Series([0, 0, 1, 1, 1])
+        
+        suspicious = detect_potential_leakage(X_train, y_train, X_val, y_val, threshold=0.5)
+        
+        # feature2 should be flagged due to correlation difference
+        assert 'feature2' in suspicious
+    
+    def test_verify_temporal_split(self):
+        """Test temporal split verification."""
+        train_df = pd.DataFrame({
+            'timestamp': pd.date_range('2024-01-01', periods=70, freq='h')
+        })
+        val_df = pd.DataFrame({
+            'timestamp': pd.date_range('2024-01-04', periods=15, freq='h')
+        })
+        test_df = pd.DataFrame({
+            'timestamp': pd.date_range('2024-01-05', periods=15, freq='h')
+        })
+        
+        # Valid split (no overlap)
+        assert verify_temporal_split(train_df, val_df, test_df, 'timestamp') == True
+        
+        # Invalid split (overlap)
+        val_df_overlap = pd.DataFrame({
+            'timestamp': pd.date_range('2024-01-03', periods=15, freq='h')
+        })
+        assert verify_temporal_split(train_df, val_df_overlap, test_df, 'timestamp') == False
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
